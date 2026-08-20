@@ -73,6 +73,23 @@ const ZOOM_STEP = 0.1
 /** Per-host zoom memory (localStorage, global across sessions). */
 const ZOOM_STORE_KEY = 'dsh-browser-zoom-by-host'
 
+/**
+ * Guest preload: captured Ctrl+wheel inside the <webview> (the guest is a
+ * separate renderer; wheel never bubbles to the parent). Works in a
+ * sandboxed guest — Electron's sandboxed preloads still get a polyfilled
+ * `require('electron').ipcRenderer`. Written to the session workspace and
+ * referenced via the webview `preload` attribute (file:// URL).
+ */
+const ZOOM_PRELOAD_FILENAME = '.dsh-browser-zoom-preload.js'
+const ZOOM_PRELOAD_JS = `const { ipcRenderer } = require('electron');
+window.addEventListener('wheel', (e) => {
+  if (e.ctrlKey) {
+    e.preventDefault();
+    ipcRenderer.sendToHost('zoom-wheel', e.deltaY);
+  }
+}, { passive: false, capture: true });
+`
+
 function zoomStoreRead(): Record<string, number> {
   try {
     const parsed = JSON.parse(localStorage.getItem(ZOOM_STORE_KEY) ?? '{}') as unknown
@@ -123,13 +140,15 @@ export function BrowserView(props: TabComponentProps) {
   /** The user asked to load the refused site anyway (keeps the plain iframe). */
   const [forceEmbed, setForceEmbed] = useState(false)
   /** Page zoom factor (1 = 100%). Applied to the <webview> via setZoomFactor
-   *  and remembered per hostname (localStorage). Ctrl+wheel inside the guest
-   *  is the webview's native Chromium zoom; its `zoom-changed` event keeps
-   *  this state and the persistence in sync. */
+   *  and remembered per hostname (localStorage). Ctrl+wheel is captured by a
+   *  guest preload (ipcRenderer.sendToHost) because wheel events inside the
+   *  webview guest never bubble to the parent page. */
   const [zoom, setZoom] = useState(1)
+  /** Live zoom value for event handlers created inside the mount effect. */
+  const zoomRef = useRef(1)
   const persistZoomForHost = (factor: number): void => {
     // Read the live guest URL (ref stays fresh across navigation) so this
-    // works from both the button handler and the webview zoom-changed event.
+    // works from both the button handler and the guest zoom events.
     const live = webviewRef.current?.getURL?.() ?? url
     const host = hostOf(live ?? '')
     if (host === null) return
@@ -139,9 +158,14 @@ export function BrowserView(props: TabComponentProps) {
   }
   const applyZoom = (next: number): void => {
     const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, next))
+    zoomRef.current = clamped
     setZoom(clamped)
     persistZoomForHost(clamped)
     void webviewRef.current?.setZoomFactor?.(clamped).catch(() => { /* web build: no-op */ })
+  }
+  /** Ctrl+wheel delta from the guest preload (ipc-message channel). */
+  const zoomWheel = (delta: number): void => {
+    applyZoom(zoomRef.current + (delta > 0 ? -ZOOM_STEP : ZOOM_STEP))
   }
   const applyZoomForHost = (targetUrl: string): void => {
     const host = hostOf(targetUrl)
@@ -264,25 +288,54 @@ export function BrowserView(props: TabComponentProps) {
         console.warn('[dsh-better-sidebar] webview attached but no active sessionId yet; will re-report on next navigation')
       }
     }
+    // Ctrl+wheel inside the guest is delivered by the zoom preload via
+    // ipc-message (guest wheel events never bubble to the parent page).
+    const onIpc = (event: { channel?: string; args?: unknown[] }): void => {
+      if (event.channel === 'zoom-wheel') {
+        const delta = event.args?.[0]
+        if (typeof delta === 'number' && Number.isFinite(delta)) zoomWheel(delta)
+      }
+    }
     wv.addEventListener('did-attach', onAttach)
     wv.addEventListener('did-navigate', onNavigate)
     wv.addEventListener('did-navigate-in-page', onNavigate)
     wv.addEventListener('zoom-changed', onZoomChanged as EventListener)
-    containerRef.current.appendChild(wv)
-    // Set src AFTER append so the guest process actually picks it up. Setting
-    // it on a detached webview before append sometimes leaves the guest on
-    // about:blank.
-    if (url !== undefined) {
-      wv.setAttribute('src', url)
-      wv.src = url
-      applyZoomForHost(url)
+    wv.addEventListener('ipc-message', onIpc as EventListener)
+    // Preload must be in place before the guest's first navigation; write it
+    // into the session workspace first (async), then attach + navigate.
+    let cancelled = false
+    const bootstrap = async (): Promise<void> => {
+      try {
+        const sid = store.getSnapshot().sessionId
+        if (sid !== undefined) {
+          const { cwd } = await api.sessionCwd({ sessionId: sid })
+          const preloadAbs = `${cwd}/${ZOOM_PRELOAD_FILENAME}`.replace(/\\/g, '/')
+          await api.fsWrite({ sessionId: sid }, preloadAbs, ZOOM_PRELOAD_JS)
+          wv.setAttribute('preload', `file:///${preloadAbs}`)
+        }
+      } catch {
+        // Zoom wheel degrades gracefully (buttons still work) when the
+        // workspace is unwritable or the session is not ready.
+      }
+      if (cancelled) return
+      if (containerRef.current === null || containerRef.current.querySelector('webview') !== null) return
+      containerRef.current.appendChild(wv)
+      // Set src AFTER append so the guest process actually picks it up.
+      if (url !== undefined) {
+        wv.setAttribute('src', url)
+        wv.src = url
+        applyZoomForHost(url)
+      }
+      webviewRef.current = wv
     }
-    webviewRef.current = wv
+    void bootstrap()
     return () => {
+      cancelled = true
       wv.removeEventListener('did-attach', onAttach)
       wv.removeEventListener('did-navigate', onNavigate)
       wv.removeEventListener('did-navigate-in-page', onNavigate)
       wv.removeEventListener('zoom-changed', onZoomChanged as EventListener)
+      wv.removeEventListener('ipc-message', onIpc as EventListener)
       webviewRef.current = null
       wv.remove()
     }
