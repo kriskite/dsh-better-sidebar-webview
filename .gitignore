@@ -1,0 +1,16 @@
+# 依赖与构建缓存
+node_modules/
+.pnpm-store/
+artifacts/
+dist-integration/
+pnpm-lock.yaml
+
+# 运行时补丁备份（含本地 .bak）
+*.dshwebview.bak
+
+# 本地临时
+*.log
+.DS_Store
+Thumbs.db
+.screenshots/
+.uploads/
