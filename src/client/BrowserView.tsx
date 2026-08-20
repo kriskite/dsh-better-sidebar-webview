@@ -61,7 +61,15 @@ type WebviewTag = HTMLElement & {
   reload(): void
   stop(): void
   isLoading(): boolean
+  /** Electron <webview> zoom controls (renderer-callable, no host needed). */
+  setZoomFactor?: (factor: number) => Promise<void>
+  getZoomFactor?: () => Promise<number>
 }
+
+/** Zoom range and step for the address-bar zoom controls. */
+const ZOOM_MIN = 0.5
+const ZOOM_MAX = 3
+const ZOOM_STEP = 0.1
 
 /** True when the hosting Electron shell has <webview> tags enabled. */
 function webviewSupported(): boolean {
@@ -95,6 +103,13 @@ export function BrowserView(props: TabComponentProps) {
   const [embedBlocked, setEmbedBlocked] = useState<string | null>(null)
   /** The user asked to load the refused site anyway (keeps the plain iframe). */
   const [forceEmbed, setForceEmbed] = useState(false)
+  /** Page zoom factor (1 = 100%). Applied to the <webview> via setZoomFactor. */
+  const [zoom, setZoom] = useState(1)
+  const applyZoom = (next: number): void => {
+    const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, next))
+    setZoom(clamped)
+    void webviewRef.current?.setZoomFactor?.(clamped).catch(() => { /* web build: no-op */ })
+  }
   /** The extension bridge drives a real Chrome tab, so frame-blocking headers
    * do not apply. Poll lightly because the extension may connect after mount. */
   const [bridgeConnected, setBridgeConnected] = useState(false)
@@ -353,6 +368,36 @@ export function BrowserView(props: TabComponentProps) {
         >
           <IconLinkOutline14 />
         </button>
+        {webviewReady && (
+          <span className={css.browserZoom}>
+            <button
+              type="button"
+              className={css.iconButton}
+              aria-label="缩小"
+              title={`缩小（最低 ${Math.round(ZOOM_MIN * 100)}%）`}
+              onClick={() => { applyZoom(zoom - ZOOM_STEP) }}
+            >
+              −
+            </button>
+            <button
+              type="button"
+              className={css.browserZoomValue}
+              title="点击重置为 100%"
+              onClick={() => { applyZoom(1) }}
+            >
+              {Math.round(zoom * 100)}%
+            </button>
+            <button
+              type="button"
+              className={css.iconButton}
+              aria-label="放大"
+              title={`放大（最高 ${Math.round(ZOOM_MAX * 100)}%）`}
+              onClick={() => { applyZoom(zoom + ZOOM_STEP) }}
+            >
+              +
+            </button>
+          </span>
+        )}
         <button
           type="button"
           className={css.iconButton}

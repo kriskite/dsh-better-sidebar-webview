@@ -1167,6 +1167,31 @@
   border-color: var(--dsw-alias-border-l2);
 }
 
+/* Address-bar zoom controls: minus / percent / plus. */
+.browserZoom {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.browserZoomValue {
+  min-width: 44px;
+  height: 24px;
+  padding: 0 4px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 5px;
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary);
+  font: var(--dsw-font-xxs-12);
+  text-align: center;
+  cursor: pointer;
+}
+
+.browserZoomValue:hover {
+  border-color: var(--dsw-alias-border-l2);
+}
+
 .browserMessage {
   flex: none;
   padding: 4px 12px;
