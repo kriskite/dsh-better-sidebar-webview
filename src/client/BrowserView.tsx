@@ -70,6 +70,25 @@ type WebviewTag = HTMLElement & {
 const ZOOM_MIN = 0.5
 const ZOOM_MAX = 3
 const ZOOM_STEP = 0.1
+/** Per-host zoom memory (localStorage, global across sessions). */
+const ZOOM_STORE_KEY = 'dsh-browser-zoom-by-host'
+
+function zoomStoreRead(): Record<string, number> {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(ZOOM_STORE_KEY) ?? '{}') as unknown
+    return parsed !== null && typeof parsed === 'object' ? parsed as Record<string, number> : {}
+  } catch {
+    return {}
+  }
+}
+
+function zoomStoreWrite(map: Record<string, number>): void {
+  try { localStorage.setItem(ZOOM_STORE_KEY, JSON.stringify(map)) } catch { /* storage full/blocked: ignore */ }
+}
+
+function hostOf(raw: string): string | null {
+  try { return new URL(raw).hostname } catch { return null }
+}
 
 /** True when the hosting Electron shell has <webview> tags enabled. */
 function webviewSupported(): boolean {
@@ -103,10 +122,33 @@ export function BrowserView(props: TabComponentProps) {
   const [embedBlocked, setEmbedBlocked] = useState<string | null>(null)
   /** The user asked to load the refused site anyway (keeps the plain iframe). */
   const [forceEmbed, setForceEmbed] = useState(false)
-  /** Page zoom factor (1 = 100%). Applied to the <webview> via setZoomFactor. */
+  /** Page zoom factor (1 = 100%). Applied to the <webview> via setZoomFactor
+   *  and remembered per hostname (localStorage). Ctrl+wheel inside the guest
+   *  is the webview's native Chromium zoom; its `zoom-changed` event keeps
+   *  this state and the persistence in sync. */
   const [zoom, setZoom] = useState(1)
+  const persistZoomForHost = (factor: number): void => {
+    // Read the live guest URL (ref stays fresh across navigation) so this
+    // works from both the button handler and the webview zoom-changed event.
+    const live = webviewRef.current?.getURL?.() ?? url
+    const host = hostOf(live ?? '')
+    if (host === null) return
+    const map = zoomStoreRead()
+    map[host] = factor
+    zoomStoreWrite(map)
+  }
   const applyZoom = (next: number): void => {
     const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, next))
+    setZoom(clamped)
+    persistZoomForHost(clamped)
+    void webviewRef.current?.setZoomFactor?.(clamped).catch(() => { /* web build: no-op */ })
+  }
+  const applyZoomForHost = (targetUrl: string): void => {
+    const host = hostOf(targetUrl)
+    if (host === null) return
+    const saved = zoomStoreRead()[host]
+    if (typeof saved !== 'number' || !Number.isFinite(saved)) return
+    const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, saved))
     setZoom(clamped)
     void webviewRef.current?.setZoomFactor?.(clamped).catch(() => { /* web build: no-op */ })
   }
@@ -185,9 +227,28 @@ export function BrowserView(props: TabComponentProps) {
     wv.style.margin = '0'
     const onNavigate = (): void => {
       const current = wv.getURL()
-      if (current) { setUrl(current); setInput(current); persist(current) }
+      if (current) {
+        setUrl(current); setInput(current); persist(current)
+        applyZoomForHost(current)
+      }
       reportWebContentsId()
     }
+    // Ctrl+wheel inside the guest is Chromium's native zoom; sync state +
+    // persistence from the webview's zoom-changed event so the address-bar
+    // controls always reflect the real factor.
+    const onZoomChanged = (arg?: unknown): void => {
+      let factor: number | undefined
+      if (typeof arg === 'number') factor = arg
+      else if (arg !== null && typeof arg === 'object' && 'zoomFactor' in (arg as Record<string, unknown>)) {
+        const v = (arg as Record<string, unknown>).zoomFactor
+        if (typeof v === 'number') factor = v
+      }
+      if (typeof factor !== 'number' || !Number.isFinite(factor)) return
+      const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, factor))
+      setZoom(clamped)
+      persistZoomForHost(clamped)
+    }
+    const onAttach = (): void => { reportWebContentsId() }
     // Report the guest webContentsId to the host so the webview_* agent
     // tools can read/operate THIS tab. Re-reported on attach and on every
     // navigation so session switches stay in sync. Non-desktop (web) builds
@@ -203,10 +264,10 @@ export function BrowserView(props: TabComponentProps) {
         console.warn('[dsh-better-sidebar] webview attached but no active sessionId yet; will re-report on next navigation')
       }
     }
-    const onAttach = (): void => { reportWebContentsId() }
     wv.addEventListener('did-attach', onAttach)
     wv.addEventListener('did-navigate', onNavigate)
     wv.addEventListener('did-navigate-in-page', onNavigate)
+    wv.addEventListener('zoom-changed', onZoomChanged as EventListener)
     containerRef.current.appendChild(wv)
     // Set src AFTER append so the guest process actually picks it up. Setting
     // it on a detached webview before append sometimes leaves the guest on
@@ -214,12 +275,14 @@ export function BrowserView(props: TabComponentProps) {
     if (url !== undefined) {
       wv.setAttribute('src', url)
       wv.src = url
+      applyZoomForHost(url)
     }
     webviewRef.current = wv
     return () => {
       wv.removeEventListener('did-attach', onAttach)
       wv.removeEventListener('did-navigate', onNavigate)
       wv.removeEventListener('did-navigate-in-page', onNavigate)
+      wv.removeEventListener('zoom-changed', onZoomChanged as EventListener)
       webviewRef.current = null
       wv.remove()
     }
