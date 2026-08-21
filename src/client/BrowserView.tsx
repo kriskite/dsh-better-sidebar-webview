@@ -35,7 +35,7 @@ import {
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { api } from './api.ts'
 import { embeddabilityOf, normalizeBrowserUrl } from './browser.ts'
-import { patchTab } from './state.ts'
+import { openTabInActivePane, patchTab } from './state.ts'
 import { SandboxStatusBar } from './SandboxStatusBar.tsx'
 import { t } from './locales.ts'
 import type { TabComponentProps } from './service.ts'
@@ -72,6 +72,29 @@ const ZOOM_MAX = 3
 const ZOOM_STEP = 0.1
 /** Per-host zoom memory (localStorage, global across sessions). */
 const ZOOM_STORE_KEY = 'dsh-browser-zoom-by-host'
+
+/** Browser bookmarks (localStorage, global across sessions). */
+const BOOKMARKS_STORE_KEY = 'dsh-browser-bookmarks'
+
+interface BrowserBookmark { url: string; title: string; addedAt: number }
+
+function bookmarksRead(): BrowserBookmark[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(BOOKMARKS_STORE_KEY) ?? '[]') as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((b): b is BrowserBookmark =>
+      typeof b === 'object' && b !== null &&
+      typeof (b as BrowserBookmark).url === 'string' &&
+      typeof (b as BrowserBookmark).title === 'string'
+    )
+  } catch {
+    return []
+  }
+}
+
+function bookmarksWrite(list: BrowserBookmark[]): void {
+  try { localStorage.setItem(BOOKMARKS_STORE_KEY, JSON.stringify(list)) } catch { /* ignore */ }
+}
 
 /**
  * Guest preload: captured Ctrl+wheel inside the <webview> (the guest is a
@@ -145,6 +168,38 @@ export function BrowserView(props: TabComponentProps) {
    *  webview guest never bubble to the parent page. */
   const [zoom, setZoom] = useState(1)
   /** Live zoom value for event handlers created inside the mount effect. */
+  /** Open the bookmarks overlay (false = closed). */
+  const [bookmarksOpen, setBookmarksOpen] = useState(false)
+  /** Force-refresh key for the bookmarks overlay list. */
+  const [bookmarksVersion, setBookmarksVersion] = useState(0)
+  const currentUrl = url ?? ''
+  const currentHost = hostOf(currentUrl) ?? ''
+  const isCurrentBookmarked = currentUrl !== '' && bookmarksRead().some(b => b.url === currentUrl)
+  const toggleBookmark = (): void => {
+    if (currentUrl === '') return
+    const list = bookmarksRead()
+    const idx = list.findIndex(b => b.url === currentUrl)
+    if (idx >= 0) list.splice(idx, 1)
+    else {
+      let title = currentHost || currentUrl
+      try { title = new URL(currentUrl).hostname || title } catch { /* keep */ }
+      const liveTitle = webviewRef.current?.getTitle?.()
+      list.unshift({ url: currentUrl, title: typeof liveTitle === 'string' && liveTitle !== '' ? liveTitle : title, addedAt: Date.now() })
+    }
+    bookmarksWrite(list)
+    setBookmarksVersion(v => v + 1)
+  }
+  /** Open a URL in a new browser tab inside the sidebar. */
+  const openInNewTab = (nextUrl: string): void => {
+    let host = ''
+    try { host = new URL(nextUrl).hostname } catch { /* keep empty */ }
+    store.reduce(state => openTabInActivePane(state, {
+      id: `browser:${nextUrl}`,
+      type: 'browser',
+      title: host || nextUrl,
+      path: nextUrl,
+    }))
+  }
   const zoomRef = useRef(1)
   const persistZoomForHost = (factor: number): void => {
     // Read the live guest URL (ref stays fresh across navigation) so this
@@ -234,7 +289,9 @@ export function BrowserView(props: TabComponentProps) {
     if (!webviewReady || containerRef.current === null) return
     if (containerRef.current.querySelector('webview') !== null) return
     const wv = document.createElement('webview') as unknown as WebviewTag
-    wv.setAttribute('allowpopups', 'true')
+    // NO allowpopups: window.open / target=_blank must fire new-window (which
+    // we catch below and open in a sidebar tab) instead of popping a real
+    // BrowserWindow outside the sidebar.
     // Persist: partition keeps cookies/login across reloads and restarts.
     wv.setAttribute('partition', 'persist:dsh-browser')
     wv.setAttribute('useragent', WEBVIEW_UA)
@@ -301,6 +358,21 @@ export function BrowserView(props: TabComponentProps) {
     wv.addEventListener('did-navigate-in-page', onNavigate)
     wv.addEventListener('zoom-changed', onZoomChanged as EventListener)
     wv.addEventListener('ipc-message', onIpc as EventListener)
+    // Guest-initiated new windows (window.open / target=_blank) → open in a
+    // sidebar tab, not a separate BrowserWindow. The webview's default
+    // behavior (with allowpopups omitted) is to fire this event; we prevent
+    // the default to stop Electron from popping an OS-level window.
+    const onNewWindow = (event: Event): void => {
+      const detail = (event as { url?: unknown; frameName?: unknown }).url
+      if (typeof detail !== 'string') return
+      event.preventDefault()
+      const sid = store.getSnapshot().sessionId
+      if (sid === undefined) return
+      // openInNewTab is defined in component scope; fall through to the
+      // sidebar's existing tab system (which may dedupe by id for same URL).
+      openInNewTab(detail)
+    }
+    wv.addEventListener('new-window', onNewWindow as EventListener)
     // Preload must be in place before the guest's first navigation; write it
     // into the session workspace first (async), then attach + navigate.
     let cancelled = false
@@ -336,6 +408,7 @@ export function BrowserView(props: TabComponentProps) {
       wv.removeEventListener('did-navigate-in-page', onNavigate)
       wv.removeEventListener('zoom-changed', onZoomChanged as EventListener)
       wv.removeEventListener('ipc-message', onIpc as EventListener)
+      wv.removeEventListener('new-window', onNewWindow as EventListener)
       webviewRef.current = null
       wv.remove()
     }
@@ -527,6 +600,25 @@ export function BrowserView(props: TabComponentProps) {
         <button
           type="button"
           className={css.iconButton}
+          aria-label={isCurrentBookmarked ? '移除书签' : '添加书签'}
+          title={isCurrentBookmarked ? '移除书签' : '添加书签'}
+          disabled={currentUrl === ''}
+          onClick={toggleBookmark}
+        >
+          {isCurrentBookmarked ? '★' : '☆'}
+        </button>
+        <button
+          type="button"
+          className={css.iconButton}
+          aria-label="书签列表"
+          title="书签列表"
+          onClick={() => { setBookmarksOpen(open => !open) }}
+        >
+          📚
+        </button>
+        <button
+          type="button"
+          className={css.iconButton}
           aria-label={t('browserOpenExternal')}
           title={t('browserOpenExternal')}
           disabled={url === undefined}
@@ -548,7 +640,48 @@ export function BrowserView(props: TabComponentProps) {
         />
       )}
       {webviewReady ? (
-        <div className={css.browserWebview} ref={containerRef} />
+        <div className={css.browserWebview} ref={containerRef}>
+          {bookmarksOpen && (
+            <div className={css.bookmarksOverlay} role="dialog" aria-label="书签">
+              <div className={css.bookmarksHeader}>
+                <span>书签</span>
+                <button
+                  type="button"
+                  className={css.iconButton}
+                  aria-label="关闭"
+                  onClick={() => { setBookmarksOpen(false) }}
+                >×</button>
+              </div>
+              <ul className={css.bookmarksList} key={bookmarksVersion}>
+                {bookmarksRead().length === 0
+                  ? <li className={css.bookmarksEmpty}>暂无书签，点 ☆ 收藏当前页</li>
+                  : bookmarksRead().map((b) => (
+                    <li key={b.url} className={css.bookmarksItem}>
+                      <button
+                        type="button"
+                        className={css.bookmarksOpenBtn}
+                        onClick={() => { navigateTo(b.url); setBookmarksOpen(false) }}
+                      >
+                        <span className={css.bookmarksTitle}>{b.title}</span>
+                        <span className={css.bookmarksUrl}>{b.url}</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={css.iconButton}
+                        aria-label="删除书签"
+                        title="删除书签"
+                        onClick={() => {
+                          const list = bookmarksRead().filter(x => x.url !== b.url)
+                          bookmarksWrite(list)
+                          setBookmarksVersion(v => v + 1)
+                        }}
+                      >×</button>
+                    </li>
+                  ))}
+              </ul>
+            </div>
+          )}
+        </div>
       ) : url === undefined ? (
         <div className={css.browserStart}>{t('browserStart')}</div>
       ) : isDesktop && !webviewTimedOut ? (
