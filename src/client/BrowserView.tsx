@@ -191,14 +191,29 @@ export function BrowserView(props: TabComponentProps) {
   /** Live zoom value for event handlers created inside the mount effect. */
   /** Open the bookmarks overlay (false = closed). */
   const [bookmarksOpen, setBookmarksOpen] = useState(false)
-  /** Force-refresh key for the bookmarks overlay list. */
-  const [bookmarksVersion, setBookmarksVersion] = useState(0)
+  /** Bookmarks (loaded from the host file; localStorage is the web fallback). */
+  const [bookmarks, setBookmarks] = useState<BrowserBookmark[]>([])
+  useEffect(() => {
+    let cancelled = false
+    void api.browserBookmarksRead().then(r => {
+      if (!cancelled && Array.isArray(r.list)) setBookmarks(r.list as BrowserBookmark[])
+    }).catch(() => {
+      // Web/standalone fallback: localStorage.
+      if (!cancelled) setBookmarks(bookmarksRead())
+    })
+    return () => { cancelled = true }
+  }, [])
+  const persistBookmarks = (list: BrowserBookmark[]): void => {
+    setBookmarks(list)
+    bookmarksWrite(list) // keep localStorage in sync as fallback
+    void api.browserBookmarksWrite(list).catch(() => { /* host may be unreachable */ })
+  }
   const currentUrl = url ?? ''
   const currentHost = hostOf(currentUrl) ?? ''
-  const isCurrentBookmarked = currentUrl !== '' && bookmarksRead().some(b => b.url === currentUrl)
+  const isCurrentBookmarked = currentUrl !== '' && bookmarks.some(b => b.url === currentUrl)
   const toggleBookmark = (): void => {
     if (currentUrl === '') return
-    const list = bookmarksRead()
+    const list = [...bookmarks]
     const idx = list.findIndex(b => b.url === currentUrl)
     if (idx >= 0) list.splice(idx, 1)
     else {
@@ -207,8 +222,10 @@ export function BrowserView(props: TabComponentProps) {
       const liveTitle = webviewRef.current?.getTitle?.()
       list.unshift({ url: currentUrl, title: typeof liveTitle === 'string' && liveTitle !== '' ? liveTitle : title, addedAt: Date.now() })
     }
-    bookmarksWrite(list)
-    setBookmarksVersion(v => v + 1)
+    persistBookmarks(list)
+  }
+  const removeBookmark = (targetUrl: string): void => {
+    persistBookmarks(bookmarks.filter(b => b.url !== targetUrl))
   }
   /** Open a URL in a new browser tab inside the sidebar. */
   const openInNewTab = (nextUrl: string): void => {
@@ -662,10 +679,10 @@ export function BrowserView(props: TabComponentProps) {
                   onClick={() => { setBookmarksOpen(false) }}
                 >×</button>
               </div>
-              <ul className={css.bookmarksList} key={bookmarksVersion}>
-                {bookmarksRead().length === 0
+              <ul className={css.bookmarksList}>
+                {bookmarks.length === 0
                   ? <li className={css.bookmarksEmpty}>暂无书签，点 ☆ 收藏当前页</li>
-                  : bookmarksRead().map((b) => (
+                  : bookmarks.map((b) => (
                     <li key={b.url} className={css.bookmarksItem}>
                       <button
                         type="button"
@@ -680,11 +697,7 @@ export function BrowserView(props: TabComponentProps) {
                         className={css.iconButton}
                         aria-label="删除书签"
                         title="删除书签"
-                        onClick={() => {
-                          const list = bookmarksRead().filter(x => x.url !== b.url)
-                          bookmarksWrite(list)
-                          setBookmarksVersion(v => v + 1)
-                        }}
+                        onClick={() => { removeBookmark(b.url) }}
                       >×</button>
                     </li>
                   ))}

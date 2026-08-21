@@ -228,6 +228,12 @@ export const api = {
    *  sessionId MUST match the agent session the tools run under. */
   browserRegisterWebContents: (sessionId: string, webContentsId: number, signal?: AbortSignal) =>
     call<{ ok: true; available: boolean }>('browser.registerWebContents', { sessionId, webContentsId }, signal),
+  /** Read browser bookmarks (host persists them to ~/.dsh — survives restarts). */
+  browserBookmarksRead: (signal?: AbortSignal) =>
+    call<{ list: Array<{ url: string; title: string; addedAt: number }> }>('browser.bookmarks.read', {}, signal),
+  /** Persist browser bookmarks. */
+  browserBookmarksWrite: (list: Array<{ url: string; title: string; addedAt: number }>, signal?: AbortSignal) =>
+    call<{ ok: true }>('browser.bookmarks.write', { list }, signal),
 }
 
 /** Absolute URL of the media route for one path (images only). */

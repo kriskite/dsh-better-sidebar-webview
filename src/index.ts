@@ -14,6 +14,7 @@
  * processes are keyed by session.
  */
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join } from 'node:path'
 import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
@@ -436,6 +437,25 @@ function buildApi(
     'browser.unregisterSession': (payload) => {
       const sessionId = requireString(payload, 'sessionId')
       automation.unregisterSession(sessionId)
+      return { ok: true }
+    },
+    // Browser bookmarks persisted to ~/.dsh/browser-bookmarks.json. File
+    // storage (not localStorage) so bookmarks survive DSH Desktop restarts
+    // even when the app origin/port changes.
+    'browser.bookmarks.read': async () => {
+      try {
+        const text = await readFile(join(homedir(), '.dsh', 'browser-bookmarks.json'), 'utf8')
+        const parsed = JSON.parse(text) as unknown
+        return { list: Array.isArray(parsed) ? parsed : [] }
+      } catch {
+        return { list: [] }
+      }
+    },
+    'browser.bookmarks.write': async (payload) => {
+      const list = (payload as { list?: unknown }).list
+      if (!Array.isArray(list)) throw new SidebarError('bad-request', 'list must be an array', 400)
+      await mkdir(join(homedir(), '.dsh'), { recursive: true })
+      await writeFile(join(homedir(), '.dsh', 'browser-bookmarks.json'), JSON.stringify(list, null, 2), 'utf8')
       return { ok: true }
     },
     'browser.bridge.navigate': async (payload) => {
