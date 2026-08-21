@@ -97,20 +97,41 @@ function bookmarksWrite(list: BrowserBookmark[]): void {
 }
 
 /**
- * Guest preload: captured Ctrl+wheel inside the <webview> (the guest is a
- * separate renderer; wheel never bubbles to the parent). Works in a
- * sandboxed guest — Electron's sandboxed preloads still get a polyfilled
+ * Guest preload: runs inside the <webview> guest (a separate renderer; DOM
+ * events never bubble to the parent page). Works in a sandboxed guest —
+ * Electron's sandboxed preloads still get a polyfilled
  * `require('electron').ipcRenderer`. Written to the session workspace and
  * referenced via the webview `preload` attribute (file:// URL).
+ * Channels:
+ *   - 'zoom-wheel'   : Ctrl+wheel delta → parent applies setZoomFactor
+ *   - 'open-new-tab' : target=_blank / window.open url → parent opens a
+ *                      sidebar tab (webview has NO new-window element event,
+ *                      so popup interception must happen here in the guest).
  */
-const ZOOM_PRELOAD_FILENAME = '.dsh-browser-zoom-preload.js'
-const ZOOM_PRELOAD_JS = `const { ipcRenderer } = require('electron');
+const PRELOAD_FILENAME = '.dsh-browser-preload.js'
+const PRELOAD_JS = `const { ipcRenderer } = require('electron');
+const send = (c, v) => { try { ipcRenderer.sendToHost(c, v); } catch (_) {} };
 window.addEventListener('wheel', (e) => {
   if (e.ctrlKey) {
     e.preventDefault();
-    ipcRenderer.sendToHost('zoom-wheel', e.deltaY);
+    send('zoom-wheel', e.deltaY);
   }
 }, { passive: false, capture: true });
+document.addEventListener('click', (e) => {
+  const t = e.target;
+  const a = t && t.closest ? t.closest('a') : null;
+  if (!a) return;
+  const target = (a.getAttribute('target') || '').toLowerCase();
+  if (target !== '_blank') return;
+  const href = a.href || a.getAttribute('href') || '';
+  if (!href || href.indexOf('javascript:') === 0) return;
+  e.preventDefault();
+  send('open-new-tab', href);
+}, true);
+window.open = function (url, name, features) {
+  if (typeof url === 'string' && url) send('open-new-tab', url);
+  return null;
+};
 `
 
 function zoomStoreRead(): Record<string, number> {
@@ -289,9 +310,10 @@ export function BrowserView(props: TabComponentProps) {
     if (!webviewReady || containerRef.current === null) return
     if (containerRef.current.querySelector('webview') !== null) return
     const wv = document.createElement('webview') as unknown as WebviewTag
-    // NO allowpopups: window.open / target=_blank must fire new-window (which
-    // we catch below and open in a sidebar tab) instead of popping a real
-    // BrowserWindow outside the sidebar.
+    // NO allowpopups: window.open / target=_blank must NOT pop an OS-level
+    // BrowserWindow. Popup interception happens inside the guest preload
+    // (PRELOAD_JS): it catches target=_blank clicks + window.open and asks
+    // the parent (ipc-message 'open-new-tab') to open a sidebar tab instead.
     // Persist: partition keeps cookies/login across reloads and restarts.
     wv.setAttribute('partition', 'persist:dsh-browser')
     wv.setAttribute('useragent', WEBVIEW_UA)
@@ -345,12 +367,16 @@ export function BrowserView(props: TabComponentProps) {
         console.warn('[dsh-better-sidebar] webview attached but no active sessionId yet; will re-report on next navigation')
       }
     }
-    // Ctrl+wheel inside the guest is delivered by the zoom preload via
-    // ipc-message (guest wheel events never bubble to the parent page).
+    // Guest events (from the preload via ipcRenderer.sendToHost):
+    //   - 'zoom-wheel'   : Ctrl+wheel delta
+    //   - 'open-new-tab' : target=_blank / window.open → sidebar tab
     const onIpc = (event: { channel?: string; args?: unknown[] }): void => {
       if (event.channel === 'zoom-wheel') {
         const delta = event.args?.[0]
         if (typeof delta === 'number' && Number.isFinite(delta)) zoomWheel(delta)
+      } else if (event.channel === 'open-new-tab') {
+        const u = event.args?.[0]
+        if (typeof u === 'string' && u !== '') openInNewTab(u)
       }
     }
     wv.addEventListener('did-attach', onAttach)
@@ -358,21 +384,6 @@ export function BrowserView(props: TabComponentProps) {
     wv.addEventListener('did-navigate-in-page', onNavigate)
     wv.addEventListener('zoom-changed', onZoomChanged as EventListener)
     wv.addEventListener('ipc-message', onIpc as EventListener)
-    // Guest-initiated new windows (window.open / target=_blank) → open in a
-    // sidebar tab, not a separate BrowserWindow. The webview's default
-    // behavior (with allowpopups omitted) is to fire this event; we prevent
-    // the default to stop Electron from popping an OS-level window.
-    const onNewWindow = (event: Event): void => {
-      const detail = (event as { url?: unknown; frameName?: unknown }).url
-      if (typeof detail !== 'string') return
-      event.preventDefault()
-      const sid = store.getSnapshot().sessionId
-      if (sid === undefined) return
-      // openInNewTab is defined in component scope; fall through to the
-      // sidebar's existing tab system (which may dedupe by id for same URL).
-      openInNewTab(detail)
-    }
-    wv.addEventListener('new-window', onNewWindow as EventListener)
     // Preload must be in place before the guest's first navigation; write it
     // into the session workspace first (async), then attach + navigate.
     let cancelled = false
@@ -381,8 +392,8 @@ export function BrowserView(props: TabComponentProps) {
         const sid = store.getSnapshot().sessionId
         if (sid !== undefined) {
           const { cwd } = await api.sessionCwd({ sessionId: sid })
-          const preloadAbs = `${cwd}/${ZOOM_PRELOAD_FILENAME}`.replace(/\\/g, '/')
-          await api.fsWrite({ sessionId: sid }, preloadAbs, ZOOM_PRELOAD_JS)
+          const preloadAbs = `${cwd}/${PRELOAD_FILENAME}`.replace(/\\/g, '/')
+          await api.fsWrite({ sessionId: sid }, preloadAbs, PRELOAD_JS)
           wv.setAttribute('preload', `file:///${preloadAbs}`)
         }
       } catch {
@@ -408,7 +419,6 @@ export function BrowserView(props: TabComponentProps) {
       wv.removeEventListener('did-navigate-in-page', onNavigate)
       wv.removeEventListener('zoom-changed', onZoomChanged as EventListener)
       wv.removeEventListener('ipc-message', onIpc as EventListener)
-      wv.removeEventListener('new-window', onNewWindow as EventListener)
       webviewRef.current = null
       wv.remove()
     }
